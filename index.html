@@ -1,0 +1,1395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FPS Controller Testbed/template</title>
+    <style>
+        @font-face {
+            font-family: 'REDDEN';
+            src: url('assets/ui-parts/Redden.ttf') format('truetype');
+            font-display: swap;
+        }
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #111;
+            font-family: 'REDDEN', monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+        #blocker {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.7);
+            z-index: 20;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #fff;
+            text-align: center;
+            cursor: pointer;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+    <script src="assets/models/js_maps/open_arena.js"></script>
+</head>
+<body>
+
+    <div id="blocker">
+        <div>
+            <div style="font-size: 30px; margin-bottom: 16px;">CLICK TO LOCK MOUSE & TEST</div>
+            <div style="font-size: 18px; color: #aaa; text-align: left; line-height: 1.8;">
+                WASD - Movement<br>
+                CAPS LOCK - Toggle sprint (SHIFT to hold)<br>
+                C - Slide above 20 MPH / Q - Air dash<br>
+                SPACE - Jump / E - Pickup / 1-2 - Switch<br>
+                Hold P, release to throw / R - Reload / Click - Fire
+            </div>
+        </div>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script>
+        // --- DATA STATE ---
+        const keys = { w: false, a: false, s: false, d: false, shift: false, crouch: false, space: false, dash: false, dashPressed: false, jumpPressed: false };
+        let isGrounded = false;
+        let isCrouching = false;
+        let isSliding = false;
+        let sprintToggle = false;
+        
+        let standHeight = 1.8;
+        let crouchHeight = 0.9;
+        let currentHeight = standHeight;
+        const playerRadius = 0.6;
+
+        let slideDirection = new THREE.Vector3();
+        let slideSpeed = 0;
+        const slideDecayRate = 4.5; 
+        const maxSlideBoost = 25.0;
+
+        let cameraPitch = 0;
+        let cameraYaw = 0;
+        let cameraRoll = 0;
+        const mouseSensitivity = 0.0022;
+        let headBobCycle = 0;
+
+        let scene, camera, renderer, clock;
+        let hudScene, hudCamera, weaponScene, weaponCamera, weaponRig;
+        let world, playerPhysicsBody, currentMap;
+        let hudRoot, hudPanels, healthFillMesh, healthMeterGroup, healthReadoutCanvas, healthReadoutTexture;
+        let speedPanelGroup;
+        let speedCanvas, speedContext, speedTexture;
+        let weaponAmmoCanvas, weaponAmmoContext, weaponAmmoTexture, weaponAmmoPanel;
+        let weaponPreviewPivot;
+        const weaponCatalog = {
+            p15: {
+                name: 'UMD P-15',
+                worldModel: 'UMD-p15.glb',
+                viewModel: 'UMD-p15viewmodel.glb',
+                magazineSize: 13,
+                reserveSize: 90,
+                fireInterval: 230,
+                burstCount: 1
+            },
+            smg: {
+                name: 'SMG-X19',
+                worldModel: 'SMG-x19.glb',
+                viewModel: 'SMG-x19viewmodel.glb',
+                magazineSize: 30,
+                reserveSize: 120,
+                fireInterval: 500,
+                burstCount: 3
+            }
+        };
+        const weaponTemplates = {};
+        const weaponInventory = [];
+        const weaponPickups = [];
+        const ejectedBrass = [];
+        let equippedWeaponIndex = 0;
+        let shellModelAsset;
+        let burstRemaining = 0;
+        let nextBurstShotAt = 0;
+        let lastBurstStart = -Infinity;
+        let throwStartedAt = 0;
+        let throwCharge = 0;
+        let pickupNearby = null;
+        let coyoteTimer = 0;
+        let jumpBufferTimer = 0;
+        let extraJumpAvailable = true;
+        let airDashAvailable = true;
+        let airDashCooldown = 0;
+        let launchPadCooldown = 0;
+        let muzzleFlashTimer = 0;
+        let reticleMaterial, reticleHitTimer = 0;
+        let reloadInProgress = false;
+        let reloadTimer = 0;
+        let lastShotTime = 0;
+        let weaponRecoil = 0;
+        let previousWeaponYaw = 0;
+        let previousWeaponPitch = 0;
+        const weaponTracers = [];
+        const weaponImpacts = [];
+        const shotRaycaster = new THREE.Raycaster();
+        let playerHealth = 100;
+        const maxPlayerHealth = 100;
+        let lastHudSpeed = '';
+        let previousHudYaw = 0;
+        let previousHudPitch = 0;
+        const spatialHudScale = 0.78;
+        const upVector = new THREE.Vector3(0, 1, 0);
+        const collidableMeshes = [];
+        
+        const target_amount = [];
+        let playerscore =  0;
+
+        // --- CORE INITIALIZATION ---
+        function init() {
+            clock = new THREE.Clock();
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x222222);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.rotation.order = 'YXZ';
+            scene.add(camera);
+            document.fonts.load('32px REDDEN').then(createSpatialHud).catch(() => createSpatialHud());
+
+            hudScene = new THREE.Scene();
+            hudCamera = new THREE.PerspectiveCamera(camera.fov, camera.aspect, camera.near, camera.far);
+            hudCamera.rotation.order = 'YXZ';
+            hudScene.add(hudCamera);
+
+            weaponScene = new THREE.Scene();
+            weaponCamera = new THREE.PerspectiveCamera(camera.fov, camera.aspect, camera.near, camera.far);
+            weaponCamera.rotation.order = 'YXZ';
+            weaponScene.add(weaponCamera);
+            weaponRig = new THREE.Group();
+            weaponCamera.add(weaponRig);
+            weaponScene.add(new THREE.HemisphereLight(0xffffff, 0x383342, 1.6));
+            const weaponLight = new THREE.DirectionalLight(0xffffff, 1.7);
+            weaponLight.position.set(-1, 2, 3);
+            weaponScene.add(weaponLight);
+            hudScene.add(new THREE.HemisphereLight(0xffffff, 0x302922, 1.3));
+            const hudLight = new THREE.DirectionalLight(0xffffff, 1.2);
+            hudLight.position.set(-1, 2, 3);
+            hudScene.add(hudLight);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.autoClear = false;
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            // Physics
+            world = new CANNON.World();
+            world.gravity.set(0, -24, 0);
+            world.broadphase = new CANNON.NaiveBroadphase();
+            world.solver.iterations = 10;
+
+            const playerPhysMat = new CANNON.Material("playerMat");
+            const groundPhysMat = new CANNON.Material("groundMat");
+            const interactionMat = new CANNON.ContactMaterial(groundPhysMat, playerPhysMat, {
+                friction: 0.0,
+                restitution: 0.0
+            });
+            world.addContactMaterial(interactionMat);
+
+            currentMap = window.AeroARCMaps.openArena({
+                THREE,
+                CANNON,
+                scene,
+                world,
+                groundMaterial: groundPhysMat,
+                collidableMeshes
+            });
+
+            // Player body
+            const sphereShape = new CANNON.Sphere(playerRadius);
+            playerPhysicsBody = new CANNON.Body({
+                mass: 75,
+                shape: sphereShape,
+                material: playerPhysMat
+            });
+            playerPhysicsBody.position.copy(currentMap.spawn);
+            playerPhysicsBody.fixedRotation = true;
+            playerPhysicsBody.linearDamping = 0.12;
+            world.addBody(playerPhysicsBody);
+            currentMap.weaponSpawns.forEach((spawn) => createWeaponPickup(spawn.type, spawn.position));
+            initializeWeaponSystem();
+
+            // Basic light
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+            dirLight.position.set(20, 40, 20);
+            scene.add(dirLight);
+
+            setupControls();
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // --- POINTER LOCK & INPUT HANDLERS ---
+        function setupControls() {
+            const blocker = document.getElementById('blocker');
+            const container = document.getElementById('canvas-container');
+
+            // Robust click handling targeting canvas element or blocker container wrapper directly
+            const requestLock = () => {
+                document.body.requestPointerLock() || container.requestPointerLock();
+            };
+
+            blocker.addEventListener('click', requestLock);
+            container.addEventListener('click', requestLock);
+            document.addEventListener('wheel', (event) => {
+                if (!document.pointerLockElement) return;
+                event.preventDefault();
+                if (event.deltaY !== 0) switchWeapon(Math.sign(event.deltaY));
+            }, { passive: false });
+
+            document.addEventListener('pointerlockchange', () => {
+                if (document.pointerLockElement === document.body || document.pointerLockElement === container) {
+                    blocker.style.display = 'none';
+                } else {
+                    blocker.style.display = 'flex';
+                    // Flush lingering movement inputs on unlock sequence
+                    Object.keys(keys).forEach(k => keys[k] = false);
+                    sprintToggle = false;
+                    throwStartedAt = 0;
+                }
+            });
+
+            // Catch errors and force immediate fallback hiding if environment blocks locking features completely
+            document.addEventListener('pointerlockerror', () => {
+                console.warn("Pointer lock failed or was blocked by sandbox container constraints.");
+                blocker.style.display = 'none'; 
+            });
+
+            document.addEventListener('mousedown', (event) => {
+                if (event.button === 0 && document.pointerLockElement) fireWeapon();
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                // Remove pointer lock requirement check if preview panel constraints interfere
+                cameraYaw -= e.movementX * mouseSensitivity;
+                cameraPitch -= e.movementY * mouseSensitivity;
+                cameraPitch = Math.max(-Math.PI / 2.05, Math.min(Math.PI / 2.05, cameraPitch));
+            });
+
+            window.addEventListener('keydown', (e) => {
+                switch (e.code) {
+                    case 'KeyW': keys.w = true; break;
+                    case 'KeyA': keys.a = true; break;
+                    case 'KeyS': keys.s = true; break;
+                    case 'KeyD': keys.d = true; break;
+                    case 'ShiftLeft': keys.shift = true; break;
+                    case 'CapsLock':
+                        if (!e.repeat) sprintToggle = !sprintToggle;
+                        break;
+                    case 'KeyC': keys.crouch = true; break;
+                    case 'Space':
+                        if (!keys.space) keys.jumpPressed = true;
+                        keys.space = true;
+                        break;
+                    case 'KeyR': if (!e.repeat) reloadWeapon(); break;
+                    case 'KeyE': if (!e.repeat) tryPickUpWeapon(); break;
+                    case 'KeyP': if (!e.repeat) throwStartedAt = performance.now(); break;
+                    case 'KeyQ':
+                        if (!keys.dash) keys.dashPressed = true;
+                        keys.dash = true;
+                        break;
+                    case 'Digit1': if (!e.repeat) equipWeapon(0); break;
+                    case 'Digit2': if (!e.repeat) equipWeapon(1); break;
+
+                }
+            });
+
+            window.addEventListener('keyup', (e) => {
+                switch (e.code) {
+                    case 'KeyW': keys.w = false; break;
+                    case 'KeyA': keys.a = false; break;
+                    case 'KeyS': keys.s = false; break;
+                    case 'KeyD': keys.d = false; break;
+                    case 'ShiftLeft': keys.shift = false; break;
+                    case 'KeyC': keys.crouch = false; break;
+                    case 'Space': keys.space = false; break;
+                    case 'KeyP':
+                        if (throwStartedAt) {
+                            throwCharge = THREE.MathUtils.clamp((performance.now() - throwStartedAt) / 900, 0, 1);
+                            throwEquippedWeapon();
+                            throwStartedAt = 0;
+                        }
+                        break;
+                    case 'KeyQ': keys.dash = false; break;
+                }
+            });
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            hudCamera.aspect = camera.aspect;
+            hudCamera.updateProjectionMatrix();
+            weaponCamera.aspect = camera.aspect;
+            weaponCamera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            positionSpatialHud();
+        }
+
+
+        // --- CAMERA-SPACE 3D HUD ---
+        function makeHudPlane(width, height, material) {
+            const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), material);
+            mesh.frustumCulled = false;
+            return mesh;
+        }
+
+        function makeHudPlate(width, height, slant, material) {
+            const shape = new THREE.Shape();
+            shape.moveTo(-width * 0.5 + slant, -height * 0.5);
+            shape.lineTo(width * 0.5, -height * 0.5);
+            shape.lineTo(width * 0.5 - slant, height * 0.5);
+            shape.lineTo(-width * 0.5, height * 0.5);
+            shape.closePath();
+            const plate = new THREE.Mesh(new THREE.ShapeGeometry(shape), material);
+            plate.frustumCulled = false;
+            plate.renderOrder = 5;
+            return plate;
+        }
+
+        function makeHudTexture(canvas) {
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.minFilter = THREE.LinearFilter;
+            texture.magFilter = THREE.LinearFilter;
+            texture.generateMipmaps = false;
+            texture.encoding = THREE.sRGBEncoding;
+            return texture;
+        }
+
+        function createHealthReadout() {
+            const context = healthReadoutCanvas.getContext('2d');
+            context.clearRect(0, 0, healthReadoutCanvas.width, healthReadoutCanvas.height);
+            context.textAlign = 'center';
+            context.textBaseline = 'middle';
+            context.shadowColor = '#f12b32';
+            context.shadowBlur = 24;
+            context.font = '250px REDDEN';
+            context.fillStyle = '#f0ece5';
+            context.fillText(String(Math.ceil(playerHealth)), 310, 126, 430);
+            context.shadowBlur = 0;
+            context.font = '150px REDDEN';
+            context.fillStyle = '#ff3838';
+            context.fillText('HP', 620, 130, 180);
+            healthReadoutTexture.needsUpdate = true;
+        }
+
+        function setPlayerHealth(value) {
+            playerHealth = THREE.MathUtils.clamp(value, 0, maxPlayerHealth);
+            if (!healthFillMesh) return;
+            const ratio = playerHealth / maxPlayerHealth;
+            healthFillMesh.scale.y = ratio;
+            healthFillMesh.position.y = healthMeterGroup.userData.meterY + meterHeight * (1 - ratio) * 0.5;
+            createHealthReadout();
+        }
+
+        let meterHeight = 0.59;
+
+        function positionSpatialHud() {
+            if (!healthMeterGroup || !speedPanelGroup || !weaponAmmoPanel || !camera) return;
+            const distance = 1.4;
+            const halfHeight = Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * distance;
+            const halfWidth = halfHeight * camera.aspect;
+            const uiScale = spatialHudScale;
+            const leftPanelWidth = healthMeterGroup.userData.panelWidth;
+            const leftPanelHeight = healthMeterGroup.userData.panelHeight;
+            healthMeterGroup.position.set(
+                (-halfWidth + leftPanelWidth * 0.5 + 0.06) / uiScale,
+                (-halfHeight + 0.06 + leftPanelHeight * 0.5) / uiScale,
+                -distance / uiScale
+            );
+            healthMeterGroup.userData.readout.position.set(
+                0,
+                healthMeterGroup.userData.readoutY,
+                0.02
+            );
+            const statusX = halfWidth - speedPanelGroup.userData.width * 0.5 - 0.06;
+            speedPanelGroup.position.set(
+                statusX / uiScale,
+                (halfHeight - speedPanelGroup.userData.height * 0.5 - 0.08) / uiScale,
+                -distance / uiScale
+            );
+            weaponAmmoPanel.position.set(
+                0,
+                (-halfHeight + 0.06 + weaponAmmoPanel.userData.height * 0.5) / uiScale,
+                -distance / uiScale
+            );
+        }
+
+        function updateSpatialSpeed(speedMph, state) {
+            if (!speedContext) return;
+            const display = `${Math.round(speedMph)}|${state}`;
+            if (display === lastHudSpeed) return;
+            lastHudSpeed = display;
+            speedContext.clearRect(0, 0, speedCanvas.width, speedCanvas.height);
+            speedContext.textAlign = 'center';
+            speedContext.textBaseline = 'middle';
+            speedContext.font = '210px REDDEN';
+            speedContext.fillStyle = '#f0ece5';
+            speedContext.fillText(`${Math.round(speedMph)} MPH`, 512, 142, 960);
+            speedContext.font = '125px REDDEN';
+            speedContext.fillStyle = '#ff3838';
+            speedContext.fillText(state, 512, 390, 960);
+            speedTexture.needsUpdate = true;
+        }
+
+        function updateWeaponAmmoDisplay() {
+            if (!weaponAmmoContext) return;
+            weaponAmmoContext.clearRect(0, 0, weaponAmmoCanvas.width, weaponAmmoCanvas.height);
+            weaponAmmoContext.textAlign = 'center';
+            weaponAmmoContext.textBaseline = 'middle';
+            const slot = weaponInventory[equippedWeaponIndex];
+            const definition = slot && weaponCatalog[slot.type];
+            if (!slot || !definition) {
+                weaponAmmoTexture.needsUpdate = true;
+                return;
+            }
+            weaponAmmoContext.fillStyle = '#f2eee8';
+            weaponAmmoContext.font = '125px REDDEN';
+            weaponAmmoContext.fillText(`${definition.name}${slot.count === 2 ? ' AKIMBO' : ''}`, 650, 56, 680);
+            weaponAmmoContext.font = '185px REDDEN';
+            weaponAmmoContext.fillText(`${slot.magazine} / ${definition.magazineSize * slot.count}`, 650, 190, 680);
+            weaponAmmoContext.fillStyle = '#ff3838';
+            weaponAmmoContext.font = '155px REDDEN';
+            weaponAmmoContext.fillText(`${slot.reserve} RESERVE`, 650, 400, 680);
+            weaponAmmoTexture.needsUpdate = true;
+        }
+
+        function updateSpatialHudMotion(dt) {
+            if (!hudPanels) return;
+            const yawDelta = cameraYaw - previousHudYaw;
+            const pitchDelta = cameraPitch - previousHudPitch;
+            previousHudYaw = cameraYaw;
+            previousHudPitch = cameraPitch;
+            const response = 1 - Math.exp(-dt * 12);
+            const targetYaw = THREE.MathUtils.clamp(-yawDelta * 1.8, -0.12, 0.12);
+            const targetPitch = THREE.MathUtils.clamp(pitchDelta * 1.8, -0.08, 0.08);
+            hudPanels.rotation.y += (targetYaw - hudPanels.rotation.y) * response;
+            hudPanels.rotation.x += (targetPitch - hudPanels.rotation.x) * response;
+            hudPanels.position.x += (THREE.MathUtils.clamp(-yawDelta * 0.35, -0.045, 0.045) - hudPanels.position.x) * response;
+            hudPanels.position.y += (THREE.MathUtils.clamp(pitchDelta * 0.2, -0.025, 0.025) - hudPanels.position.y) * response;
+        }
+
+        async function createSpatialHud() {
+            hudRoot = new THREE.Group();
+            hudCamera.add(hudRoot);
+            hudPanels = new THREE.Group();
+            hudPanels.scale.setScalar(spatialHudScale);
+            hudRoot.add(hudPanels);
+
+            reticleMaterial = new THREE.MeshBasicMaterial({
+                color: 0xf4f1e8,
+                transparent: true,
+                opacity: 0.9,
+                depthTest: false,
+                depthWrite: false
+            });
+            const crosshair = new THREE.Group();
+            const horizontal = makeHudPlane(0.018, 0.0025, reticleMaterial);
+            const vertical = makeHudPlane(0.0025, 0.018, reticleMaterial);
+            crosshair.add(horizontal, vertical);
+            crosshair.position.z = -1;
+            hudRoot.add(crosshair);
+
+            const loader = new THREE.TextureLoader();
+            const loadTexture = (path) => new Promise((resolve, reject) => {
+                loader.load(path, resolve, undefined, reject);
+            });
+            const [emptyTexture, fullTexture] = await Promise.all([
+                loadTexture('assets/ui-parts/player/health-meter-empty.png'),
+                loadTexture('assets/ui-parts/player/health-meter-full.png')
+            ]);
+
+            const sourceCanvases = [emptyTexture.image, fullTexture.image].map((image) => {
+                const canvas = document.createElement('canvas');
+                canvas.width = image.width;
+                canvas.height = image.height;
+                canvas.getContext('2d').drawImage(image, 0, 0);
+                return canvas;
+            });
+            let left = sourceCanvases[0].width;
+            let top = sourceCanvases[0].height;
+            let right = 0;
+            let bottom = 0;
+            for (const canvas of sourceCanvases) {
+                const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+                for (let y = 0; y < canvas.height; y++) {
+                    for (let x = 0; x < canvas.width; x++) {
+                        if (pixels[(y * canvas.width + x) * 4 + 3] > 8) {
+                            left = Math.min(left, x);
+                            top = Math.min(top, y);
+                            right = Math.max(right, x + 1);
+                            bottom = Math.max(bottom, y + 1);
+                        }
+                    }
+                }
+            }
+            const cropWidth = right - left;
+            const cropHeight = bottom - top;
+            const textures = sourceCanvases.map((source) => {
+                const canvas = document.createElement('canvas');
+                canvas.width = cropWidth;
+                canvas.height = cropHeight;
+                canvas.getContext('2d').drawImage(source, left, top, cropWidth, cropHeight,
+                    0, 0, cropWidth, cropHeight);
+                return makeHudTexture(canvas);
+            });
+
+            const aspect = cropWidth / cropHeight;
+            const meterWidth = meterHeight * aspect;
+            healthMeterGroup = new THREE.Group();
+            healthMeterGroup.userData.panelWidth = 1.12;
+            healthMeterGroup.userData.panelHeight = 0.82;
+            healthMeterGroup.rotation.y = 0.14;
+            healthMeterGroup.rotation.z = 0.025;
+            hudPanels.add(healthMeterGroup);
+            const layerMaterial = (map) => new THREE.MeshBasicMaterial({
+                map,
+                transparent: true,
+                depthTest: false,
+                depthWrite: false,
+                side: THREE.DoubleSide,
+                toneMapped: false
+            });
+            const plateMaterial = new THREE.MeshBasicMaterial({
+                color: 0x090d10,
+                transparent: true,
+                opacity: 0.78,
+                depthTest: false,
+                depthWrite: false,
+                toneMapped: false,
+                side: THREE.DoubleSide
+            });
+            healthMeterGroup.add(makeHudPlate(1.12, 0.82, 0.14, plateMaterial));
+            const panelBottom = -healthMeterGroup.userData.panelHeight * 0.5;
+            const readoutHeight = 0.19;
+            const readoutMargin = 0.025;
+            const meterGap = 0.01;
+            const meterY = panelBottom + readoutMargin + readoutHeight + meterGap + meterHeight * 0.5;
+            healthMeterGroup.userData.meterY = meterY;
+            const emptyMesh = makeHudPlane(meterWidth, meterHeight, layerMaterial(textures[0]));
+            emptyMesh.position.y = meterY;
+            emptyMesh.renderOrder = 10;
+            healthMeterGroup.add(emptyMesh);
+            healthFillMesh = makeHudPlane(meterWidth, meterHeight, layerMaterial(textures[1]));
+            healthFillMesh.position.y = meterY;
+            healthFillMesh.renderOrder = 11;
+            healthMeterGroup.add(healthFillMesh);
+
+            healthReadoutCanvas = document.createElement('canvas');
+            healthReadoutCanvas.width = 768;
+            healthReadoutCanvas.height = 240;
+            healthReadoutTexture = makeHudTexture(healthReadoutCanvas);
+            const readout = makeHudPlane(0.94, 0.19, new THREE.MeshBasicMaterial({
+                map: healthReadoutTexture,
+                transparent: true,
+                depthTest: false,
+                depthWrite: false,
+                toneMapped: false
+            }));
+            readout.renderOrder = 12;
+            healthMeterGroup.userData.readoutY = panelBottom + readoutMargin + readoutHeight * 0.5;
+            healthMeterGroup.userData.readout = readout;
+            healthMeterGroup.add(readout);
+
+            speedPanelGroup = new THREE.Group();
+            speedPanelGroup.userData.width = 1.5;
+            speedPanelGroup.userData.height = 0.68;
+            speedPanelGroup.rotation.y = -0.14;
+            speedPanelGroup.rotation.z = -0.025;
+            speedPanelGroup.add(makeHudPlate(1.5, 0.68, 0.14, plateMaterial));
+            hudPanels.add(speedPanelGroup);
+            speedCanvas = document.createElement('canvas');
+            speedCanvas.width = 1024;
+            speedCanvas.height = 512;
+            speedContext = speedCanvas.getContext('2d');
+            speedTexture = makeHudTexture(speedCanvas);
+            const speedReadout = makeHudPlane(1.4, 0.62, new THREE.MeshBasicMaterial({
+                map: speedTexture,
+                transparent: true,
+                depthTest: false,
+                depthWrite: false,
+                toneMapped: false
+            }));
+            speedReadout.renderOrder = 12;
+            speedReadout.position.z = 0.02;
+            speedPanelGroup.add(speedReadout);
+
+            weaponAmmoPanel = new THREE.Group();
+            weaponAmmoPanel.userData.width = 1.55;
+            weaponAmmoPanel.userData.height = 0.68;
+            weaponAmmoPanel.rotation.y = 0.04;
+            weaponAmmoPanel.add(makeHudPlate(1.55, 0.68, 0.12, plateMaterial));
+            hudPanels.add(weaponAmmoPanel);
+            weaponAmmoCanvas = document.createElement('canvas');
+            weaponAmmoCanvas.width = 1024;
+            weaponAmmoCanvas.height = 512;
+            weaponAmmoContext = weaponAmmoCanvas.getContext('2d');
+            weaponAmmoTexture = makeHudTexture(weaponAmmoCanvas);
+            const ammoReadout = makeHudPlane(0.96, 0.58, new THREE.MeshBasicMaterial({
+                map: weaponAmmoTexture,
+                transparent: true,
+                depthTest: false,
+                depthWrite: false,
+                toneMapped: false
+            }));
+            ammoReadout.position.set(0.28, 0, 0.02);
+            ammoReadout.renderOrder = 12;
+            weaponAmmoPanel.add(ammoReadout);
+            weaponPreviewPivot = new THREE.Group();
+            weaponPreviewPivot.position.set(-0.49, 0, 0.04);
+            weaponAmmoPanel.add(weaponPreviewPivot);
+
+            previousHudYaw = cameraYaw;
+            previousHudPitch = cameraPitch;
+            positionSpatialHud();
+            setPlayerHealth(playerHealth);
+            updateSpatialSpeed(0, 'IDLE');
+            updateWeaponAmmoDisplay();
+            updateWeaponPreview();
+        }
+
+        function initializeWeaponSystem() {
+            weaponInventory.push({ type: 'p15', magazine: weaponCatalog.p15.magazineSize, reserve: weaponCatalog.p15.reserveSize, count: 1 });
+            const loader = new THREE.GLTFLoader();
+            for (const [type, definition] of Object.entries(weaponCatalog)) {
+                weaponTemplates[type] = {};
+                loader.load(`assets/models/weaponry/${definition.worldModel}`, (gltf) => {
+                    weaponTemplates[type].worldModel = gltf.scene;
+                    weaponPickups.filter((pickup) => pickup.type === type).forEach(updatePickupVisual);
+                    if (weaponInventory[equippedWeaponIndex]?.type === type) updateWeaponPreview();
+                }, undefined, (error) => console.error(`Could not load ${definition.worldModel}`, error));
+                loader.load(`assets/models/weaponry/${definition.viewModel}`, (gltf) => {
+                    weaponTemplates[type].viewModel = gltf.scene;
+                    weaponTemplates[type].animations = gltf.animations;
+                    if (weaponInventory[equippedWeaponIndex]?.type === type) buildEquippedViewmodel();
+                }, undefined, (error) => console.error(`Could not load ${definition.viewModel}`, error));
+            }
+            loader.load('assets/models/weaponry/machineshell.glb', (gltf) => {
+                shellModelAsset = gltf.scene;
+            }, undefined, (error) => console.error('Could not load machineshell.glb', error));
+            updateWeaponAmmoDisplay();
+        }
+
+        function createWeaponPickup(type, position, payload) {
+            const definition = weaponCatalog[type];
+            if (!definition) return null;
+            const body = new CANNON.Body({ mass: 0.7, shape: new CANNON.Sphere(0.28) });
+            body.position.copy(position);
+            body.linearDamping = 0.28;
+            body.angularDamping = 0.72;
+            world.addBody(body);
+
+            const visual = new THREE.Group();
+            scene.add(visual);
+            const beacon = new THREE.Group();
+            const beaconColor = type === 'smg' ? 0x42e4d7 : 0xff5b55;
+            const beaconRing = new THREE.Mesh(
+                new THREE.RingGeometry(0.3, 0.39, 24),
+                new THREE.MeshBasicMaterial({ color: beaconColor, transparent: true, opacity: 0.78, side: THREE.DoubleSide, depthWrite: false })
+            );
+            beaconRing.rotation.x = -Math.PI / 2;
+            beacon.add(beaconRing);
+            const beaconLight = new THREE.PointLight(beaconColor, 0.9, 2.4);
+            beaconLight.position.y = 0.3;
+            beacon.add(beaconLight);
+            scene.add(beacon);
+            const pickup = {
+                type,
+                body,
+                visual,
+                beacon,
+                beaconRing,
+                beaconLight,
+                payload: payload || {
+                    magazine: definition.magazineSize,
+                    reserve: definition.reserveSize,
+                    count: 1
+                }
+            };
+            weaponPickups.push(pickup);
+            updatePickupVisual(pickup);
+            return pickup;
+        }
+
+        function updatePickupVisual(pickup) {
+            const template = weaponTemplates[pickup.type]?.worldModel;
+            if (!template) return;
+            while (pickup.visual.children.length) pickup.visual.remove(pickup.visual.children[0]);
+            const model = template.clone(true);
+            hideFirstPersonArms(model);
+            model.rotation.x = -Math.PI * 0.5;
+            const bounds = new THREE.Box3().setFromObject(model);
+            const size = bounds.getSize(new THREE.Vector3());
+            model.scale.setScalar(0.9 / Math.max(size.x, size.y, size.z));
+            pickup.visual.add(model);
+        }
+
+        function updateWeaponPreview() {
+            if (!weaponPreviewPivot) return;
+            while (weaponPreviewPivot.children.length) weaponPreviewPivot.remove(weaponPreviewPivot.children[0]);
+            const type = weaponInventory[equippedWeaponIndex]?.type;
+            const template = weaponTemplates[type]?.worldModel;
+            if (template) createWeaponPreview(template);
+        }
+
+        function createWeaponPreview(source) {
+            if (!weaponPreviewPivot) return;
+            const preview = source.clone(true);
+            const bounds = new THREE.Box3().setFromObject(preview);
+            const size = bounds.getSize(new THREE.Vector3());
+            const center = bounds.getCenter(new THREE.Vector3());
+            preview.position.sub(center);
+            preview.scale.setScalar(0.3 / Math.max(size.x, size.y, size.z));
+            preview.rotation.y = -0.55;
+            preview.rotation.x = 0.16;
+            hideFirstPersonArms(preview);
+            preview.traverse((node) => {
+                if (!node.isMesh) return;
+                node.material = node.material.clone();
+                node.material.transparent = true;
+                node.material.depthWrite = false;
+                node.renderOrder = 8;
+            });
+            weaponPreviewPivot.add(preview);
+        }
+
+        function hideFirstPersonArms(model) {
+            model.traverse((node) => {
+                if (node.name === 'arm' || node.name === 'arms') node.visible = false;
+            });
+        }
+
+        function buildEquippedViewmodel() {
+            weaponRig.clear();
+            weaponRig.userData.hands = [];
+            const slot = weaponInventory[equippedWeaponIndex];
+            if (!slot) {
+                updateWeaponAmmoDisplay();
+                updateWeaponPreview();
+                return;
+            }
+
+            const template = weaponTemplates[slot.type];
+            if (!template?.viewModel) return;
+            const handCount = Math.min(slot.count, 2);
+            const hands = [];
+            for (let handIndex = 0; handIndex < handCount; handIndex++) {
+                const side = handCount === 1 ? 1 : (handIndex === 0 ? -1 : 1);
+                const handRig = new THREE.Group();
+                handRig.position.x = handCount === 1 ? 0 : side * 0.26;
+                handRig.scale.x = side;
+                weaponRig.add(handRig);
+                const model = template.viewModel.clone(true);
+                model.scale.setScalar(handCount === 1 ? 3 : 2.5);
+                model.rotation.y = Math.PI;
+                handRig.add(model);
+
+                const flash = new THREE.Mesh(new THREE.IcosahedronGeometry(0.03, 0), new THREE.MeshBasicMaterial({
+                    color: 0xffbd64,
+                    transparent: true,
+                    opacity: 0.95,
+                    blending: THREE.AdditiveBlending,
+                    depthTest: false,
+                    depthWrite: false,
+                    toneMapped: false
+                }));
+                flash.position.set(0, 0.025, 0.16);
+                flash.visible = false;
+                model.add(flash);
+                const flashLight = new THREE.PointLight(0xff8d3b, 0, 1.5);
+                flashLight.position.copy(flash.position);
+                model.add(flashLight);
+
+                const mixer = new THREE.AnimationMixer(model);
+                const actions = {};
+                for (const clip of template.animations || []) actions[clip.name.toUpperCase()] = mixer.clipAction(clip);
+                hands.push({ side, rig: handRig, model, flash, flashLight, mixer, actions });
+            }
+            weaponRig.userData.hands = hands;
+            playWeaponAnimation('EQUIP');
+            updateWeaponPreview();
+            updateWeaponAmmoDisplay();
+        }
+
+        function equipWeapon(index) {
+            if (!weaponInventory.length) return;
+            equippedWeaponIndex = (index + weaponInventory.length) % weaponInventory.length;
+            reloadInProgress = false;
+            burstRemaining = 0;
+            buildEquippedViewmodel();
+        }
+
+        function switchWeapon(direction) {
+            if (weaponInventory.length < 2) return;
+            equipWeapon(equippedWeaponIndex + direction);
+        }
+
+        function pickUpWeapon(pickup) {
+            const definition = weaponCatalog[pickup.type];
+            let slot = weaponInventory.find((item) => item.type === pickup.type);
+            if (!slot) {
+                slot = { type: pickup.type, magazine: 0, reserve: 0, count: 0 };
+                weaponInventory.push(slot);
+            }
+            slot.count = Math.min(2, slot.count + pickup.payload.count);
+            slot.magazine = Math.min(definition.magazineSize * slot.count, slot.magazine + pickup.payload.magazine);
+            slot.reserve = Math.min(definition.reserveSize * slot.count, slot.reserve + pickup.payload.reserve);
+            world.removeBody(pickup.body);
+            scene.remove(pickup.visual);
+            scene.remove(pickup.beacon);
+            pickup.beacon.children.forEach((child) => {
+                child.geometry?.dispose();
+                if (child.material) child.material.dispose();
+            });
+            weaponPickups.splice(weaponPickups.indexOf(pickup), 1);
+            equipWeapon(weaponInventory.indexOf(slot));
+        }
+
+        function tryPickUpWeapon() {
+            if (!pickupNearby) return;
+            pickUpWeapon(pickupNearby);
+            pickupNearby = null;
+        }
+
+        function throwEquippedWeapon() {
+            const slot = weaponInventory[equippedWeaponIndex];
+            if (!slot) return;
+            reloadInProgress = false;
+            burstRemaining = 0;
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+            const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+            const position = new CANNON.Vec3(
+                camera.position.x + forward.x * 0.8 + right.x * 0.28,
+                camera.position.y + forward.y * 0.8 + right.y * 0.28,
+                camera.position.z + forward.z * 0.8 + right.z * 0.28
+            );
+            const pickup = createWeaponPickup(slot.type, position, {
+                magazine: slot.magazine,
+                reserve: slot.reserve,
+                count: slot.count
+            });
+            if (pickup) {
+                pickup.body.velocity.set(
+                    playerPhysicsBody.velocity.x + forward.x * (7 + throwCharge * 12) + right.x * throwCharge * 2,
+                    playerPhysicsBody.velocity.y + 3 + throwCharge * 5,
+                    playerPhysicsBody.velocity.z + forward.z * (7 + throwCharge * 12) + right.z * throwCharge * 2
+                );
+                pickup.body.angularVelocity.set(4 + Math.random() * 5, 7 + Math.random() * 5, 3 + Math.random() * 4);
+            }
+            weaponInventory.splice(equippedWeaponIndex, 1);
+            if (weaponInventory.length) equippedWeaponIndex %= weaponInventory.length;
+            else equippedWeaponIndex = 0;
+            buildEquippedViewmodel();
+        }
+
+        function playWeaponAnimation(name) {
+            const hands = weaponRig.userData.hands || [];
+            let duration = 0.25;
+            for (const hand of hands) {
+                for (const action of Object.values(hand.actions)) action.stop();
+                const action = hand.actions[name];
+                if (!action) continue;
+                action.reset();
+                action.setLoop(THREE.LoopOnce, 1);
+                action.clampWhenFinished = true;
+                action.play();
+                duration = Math.max(duration, action.getClip().duration);
+            }
+            return duration;
+        }
+
+        function reloadWeapon() {
+            const slot = weaponInventory[equippedWeaponIndex];
+            if (!slot || reloadInProgress || slot.magazine >= weaponCatalog[slot.type].magazineSize * slot.count || slot.reserve <= 0) return;
+            reloadInProgress = true;
+            reloadTimer = playWeaponAnimation('RELOAD');
+        }
+
+        function fireWeapon() {
+            const now = performance.now();
+            const slot = weaponInventory[equippedWeaponIndex];
+            if (!slot || reloadInProgress || burstRemaining > 0) return;
+            const definition = weaponCatalog[slot.type];
+            if (slot.magazine <= 0) {
+                reloadWeapon();
+                return;
+            }
+            if (definition.burstCount > 1) {
+                if (now - lastBurstStart < definition.fireInterval) return;
+                lastBurstStart = now;
+                burstRemaining = definition.burstCount;
+                playWeaponAnimation('SHOOT');
+                fireWeaponRound(now, false);
+                burstRemaining--;
+                nextBurstShotAt = now + 250;
+                return;
+            }
+            if (now - lastShotTime < definition.fireInterval) return;
+            fireWeaponRound(now);
+        }
+
+        function fireWeaponRound(now = performance.now(), restartAnimation = true) {
+            const slot = weaponInventory[equippedWeaponIndex];
+            if (!slot || slot.magazine <= 0) {
+                burstRemaining = 0;
+                reloadWeapon();
+                return;
+            }
+            const hands = weaponRig.userData.hands || [];
+            const shotCount = Math.min(slot.count, slot.magazine);
+            lastShotTime = now;
+            slot.magazine -= shotCount;
+            weaponRecoil = 1;
+            cameraPitch = Math.min(Math.PI / 2.05, cameraPitch + 0.009 * shotCount);
+            if (restartAnimation) playWeaponAnimation('SHOOT');
+            for (let i = 0; i < shotCount; i++) {
+                const hand = hands[i % Math.max(1, hands.length)];
+                if (hand) {
+                    hand.flash.visible = true;
+                    hand.flash.scale.setScalar(0.8 + Math.random() * 0.55);
+                    hand.flashLight.intensity = 5;
+                    spawnBrass(hand);
+                }
+                muzzleFlashTimer = 0.055;
+
+                const aimOffset = shotCount > 1 ? (i === 0 ? -0.012 : 0.012) : 0;
+                shotRaycaster.setFromCamera(new THREE.Vector2(aimOffset, 0), camera);
+                const hits = shotRaycaster.intersectObjects(collidableMeshes, false);
+                const direction = shotRaycaster.ray.direction.clone();
+                const start = hand?.flash.getWorldPosition(new THREE.Vector3()) || camera.position.clone();
+                const end = hits.length
+                    ? hits[0].point.clone()
+                    : start.clone().addScaledVector(direction, 80);
+            const tracer = new THREE.Line(
+                new THREE.BufferGeometry().setFromPoints([start, end]),
+                new THREE.LineBasicMaterial({ color: 0xffbd64, transparent: true, opacity: 0.95 })
+            );
+            scene.add(tracer);
+            weaponTracers.push({ mesh: tracer, expiresAt: now + 75 });
+            if (hits.length) {
+                const impact = new THREE.Mesh(
+                    new THREE.IcosahedronGeometry(0.035, 0),
+                    new THREE.MeshBasicMaterial({
+                        color: 0xff7138,
+                        transparent: true,
+                        opacity: 1,
+                        blending: THREE.AdditiveBlending,
+                        depthWrite: false,
+                        toneMapped: false
+                    })
+                );
+                impact.position.copy(end).addScaledVector(hits[0].face.normal, 0.012);
+                scene.add(impact);
+                weaponImpacts.push({ mesh: impact, life: 0.16, duration: 0.16 });
+                if (reticleMaterial) {
+                    reticleMaterial.color.setHex(0xff613d);
+                    reticleHitTimer = 0.12;
+                }
+            }
+            }
+            updateWeaponAmmoDisplay();
+        }
+
+        function syncOverlayCameras() {
+            for (const overlayCamera of [hudCamera, weaponCamera]) {
+                overlayCamera.position.copy(camera.position);
+                overlayCamera.quaternion.copy(camera.quaternion);
+                overlayCamera.updateMatrixWorld(true);
+            }
+        }
+
+        function spawnBrass(hand) {
+            if (!shellModelAsset) return;
+            while (ejectedBrass.length >= 36) removeBrass(0);
+            const mesh = shellModelAsset.clone(true);
+            mesh.scale.setScalar(0.85);
+            const position = hand.flash.getWorldPosition(new THREE.Vector3());
+            const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion).multiplyScalar(hand.side);
+            const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+            mesh.position.copy(position)
+                .addScaledVector(right, 0.08)
+                .addScaledVector(up, 0.015)
+                .addScaledVector(forward, -0.14);
+            mesh.rotation.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+            scene.add(mesh);
+
+            const body = new CANNON.Body({ mass: 0.018, shape: new CANNON.Sphere(0.028) });
+            body.position.set(mesh.position.x, mesh.position.y, mesh.position.z);
+            body.velocity.set(
+                playerPhysicsBody.velocity.x + right.x * 3 + up.x * 1.8 + forward.x * 0.35,
+                playerPhysicsBody.velocity.y + right.y * 3 + up.y * 1.8 + forward.y * 0.35,
+                playerPhysicsBody.velocity.z + right.z * 3 + up.z * 1.8 + forward.z * 0.35
+            );
+            body.angularVelocity.set(14 + Math.random() * 8, 18 + Math.random() * 8, 12 + Math.random() * 8);
+            body.linearDamping = 0.12;
+            body.angularDamping = 0.04;
+            world.addBody(body);
+            ejectedBrass.push({ mesh, body, life: 4 });
+        }
+
+        function removeBrass(index) {
+            const casing = ejectedBrass[index];
+            if (!casing) return;
+            world.removeBody(casing.body);
+            scene.remove(casing.mesh);
+            ejectedBrass.splice(index, 1);
+        }
+
+        function updateWorldWeapons(dt) {
+            let nearestPickup = null;
+            let nearestDistance = 2.8;
+            for (const pickup of weaponPickups) {
+                pickup.visual.position.set(pickup.body.position.x, pickup.body.position.y, pickup.body.position.z);
+                pickup.visual.quaternion.set(pickup.body.quaternion.x, pickup.body.quaternion.y, pickup.body.quaternion.z, pickup.body.quaternion.w);
+                pickup.beacon.position.set(pickup.body.position.x, pickup.body.position.y - 0.235, pickup.body.position.z);
+                pickup.beaconRing.rotation.z += dt * 0.8;
+                pickup.beaconLight.intensity = 0.65 + Math.sin(performance.now() * 0.004) * 0.18;
+                const dx = pickup.body.position.x - playerPhysicsBody.position.x;
+                const dy = pickup.body.position.y - playerPhysicsBody.position.y;
+                const dz = pickup.body.position.z - playerPhysicsBody.position.z;
+                const distance = Math.hypot(dx, dy, dz);
+                if (distance < nearestDistance) {
+                    nearestPickup = pickup;
+                    nearestDistance = distance;
+                }
+            }
+            pickupNearby = nearestPickup;
+
+            for (let i = ejectedBrass.length - 1; i >= 0; i--) {
+                const casing = ejectedBrass[i];
+                casing.life -= dt;
+                casing.mesh.position.set(casing.body.position.x, casing.body.position.y, casing.body.position.z);
+                casing.mesh.quaternion.set(casing.body.quaternion.x, casing.body.quaternion.y, casing.body.quaternion.z, casing.body.quaternion.w);
+                if (casing.life <= 0) removeBrass(i);
+            }
+        }
+
+        function updateWeaponSystems(dt) {
+            syncOverlayCameras();
+            const hands = weaponRig.userData.hands || [];
+            for (const hand of hands) hand.mixer.update(dt);
+            if (reloadInProgress) {
+                reloadTimer -= dt;
+                if (reloadTimer <= 0) {
+                    const slot = weaponInventory[equippedWeaponIndex];
+                    if (slot) {
+                        const capacity = weaponCatalog[slot.type].magazineSize * slot.count;
+                        const loaded = Math.min(capacity - slot.magazine, slot.reserve);
+                        slot.magazine += loaded;
+                        slot.reserve -= loaded;
+                    }
+                    reloadInProgress = false;
+                    updateWeaponAmmoDisplay();
+                }
+            }
+
+            const now = performance.now();
+            if (burstRemaining > 0 && now >= nextBurstShotAt) {
+                fireWeaponRound(now, false);
+                burstRemaining = Math.max(0, burstRemaining - 1);
+                nextBurstShotAt = now + 160;
+            }
+
+            const yawDelta = cameraYaw - previousWeaponYaw;
+            const pitchDelta = cameraPitch - previousWeaponPitch;
+            previousWeaponYaw = cameraYaw;
+            previousWeaponPitch = cameraPitch;
+            const swayX = THREE.MathUtils.clamp(-yawDelta * 2.8, -0.14, 0.14);
+            const swayY = THREE.MathUtils.clamp(pitchDelta * 2.8, -0.1, 0.1);
+            const motionBlend = 1 - Math.exp(-dt * 14);
+            weaponRecoil = Math.max(0, weaponRecoil - dt * 7);
+            const viewHalfWidth = Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * 0.72 * camera.aspect;
+            const akimboEquipped = hands.length === 2;
+            const viewmodelX = akimboEquipped ? 0.18 : Math.min(0.6, viewHalfWidth * 0.56);
+            weaponRig.position.x += (viewmodelX + swayX - weaponRig.position.x) * motionBlend;
+            weaponRig.position.y += (-0.27 + swayY + weaponRecoil * 0.035 - weaponRig.position.y) * motionBlend;
+            weaponRig.position.z += (-0.92 + weaponRecoil * 0.07 - weaponRig.position.z) * motionBlend;
+            weaponRig.rotation.x += (-swayY * 0.75 - weaponRecoil * 0.16 - weaponRig.rotation.x) * motionBlend;
+            weaponRig.rotation.y += (-swayX * 0.55 - weaponRig.rotation.y) * motionBlend;
+            weaponRig.rotation.z += (-swayX * 0.45 - weaponRig.rotation.z) * motionBlend;
+
+            if (weaponPreviewPivot) weaponPreviewPivot.rotation.y += dt * 0.85;
+            muzzleFlashTimer -= dt;
+            if (muzzleFlashTimer <= 0) {
+                for (const hand of hands) {
+                    hand.flash.visible = false;
+                    hand.flashLight.intensity = 0;
+                }
+            }
+            reticleHitTimer = Math.max(0, reticleHitTimer - dt);
+            if (reticleHitTimer === 0 && reticleMaterial) reticleMaterial.color.setHex(0xf4f1e8);
+
+            for (let i = weaponImpacts.length - 1; i >= 0; i--) {
+                const impact = weaponImpacts[i];
+                impact.life -= dt;
+                const fade = Math.max(0, impact.life / impact.duration);
+                impact.mesh.scale.setScalar(1 + (1 - fade) * 1.5);
+                impact.mesh.material.opacity = fade;
+                if (impact.life <= 0) {
+                    scene.remove(impact.mesh);
+                    impact.mesh.geometry.dispose();
+                    impact.mesh.material.dispose();
+                    weaponImpacts.splice(i, 1);
+                }
+            }
+            for (let i = weaponTracers.length - 1; i >= 0; i--) {
+                const tracer = weaponTracers[i];
+                if (now >= tracer.expiresAt) {
+                    scene.remove(tracer.mesh);
+                    tracer.mesh.geometry.dispose();
+                    tracer.mesh.material.dispose();
+                    weaponTracers.splice(i, 1);
+                }
+            }
+            updateWorldWeapons(dt);
+        }
+
+
+        // --- TICK UPDATE PROCESSING ---
+        const raycaster = new THREE.Raycaster();
+        const downRayDirection = new THREE.Vector3(0, -1, 0);
+
+        function accelerateWishDirection(direction, wishSpeed, acceleration, dt) {
+            const velocity = playerPhysicsBody.velocity;
+            const currentSpeed = velocity.x * direction.x + velocity.z * direction.z;
+            const addSpeed = wishSpeed - currentSpeed;
+            if (addSpeed <= 0) return;
+            const accelerationSpeed = Math.min(addSpeed, acceleration * wishSpeed * dt);
+            velocity.x += direction.x * accelerationSpeed;
+            velocity.z += direction.z * accelerationSpeed;
+        }
+
+        function applyHorizontalFriction(deceleration, dt) {
+            const velocity = playerPhysicsBody.velocity;
+            const speed = Math.hypot(velocity.x, velocity.z);
+            if (speed === 0) return;
+            const remainingSpeed = Math.max(0, speed - deceleration * dt);
+            const frictionRatio = remainingSpeed / speed;
+            velocity.x *= frictionRatio;
+            velocity.z *= frictionRatio;
+        }
+
+        function updatePlayerMovement(dt) {
+            if (dt > 0.1) dt = 0.1;
+
+            const playerPos = new THREE.Vector3(playerPhysicsBody.position.x, playerPhysicsBody.position.y, playerPhysicsBody.position.z);
+            raycaster.set(playerPos, downRayDirection);
+            
+            const intersections = raycaster.intersectObjects(collidableMeshes);
+            isGrounded = false;
+            let groundNormal = new THREE.Vector3(0, 1, 0);
+
+            if (intersections.length > 0) {
+                if (intersections[0].distance <= playerRadius + 0.18) {
+                    isGrounded = true;
+                    if (intersections[0].face) {
+                        groundNormal.copy(intersections[0].face.normal);
+                        groundNormal.applyQuaternion(intersections[0].object.quaternion).normalize();
+                    }
+                }
+            }
+
+            const forwardVector = new THREE.Vector3(0, 0, -1).applyAxisAngle(upVector, cameraYaw).normalize();
+            const rightVector = new THREE.Vector3(1, 0, 0).applyAxisAngle(upVector, cameraYaw).normalize();
+            
+            const moveInput = new THREE.Vector3();
+            if (keys.w) moveInput.add(forwardVector);
+            if (keys.s) moveInput.sub(forwardVector);
+            if (keys.d) moveInput.add(rightVector);
+            if (keys.a) moveInput.sub(rightVector);
+            moveInput.normalize();
+            const isSprinting = keys.shift || sprintToggle;
+            const velocity = playerPhysicsBody.velocity;
+            const horizontalSpeed = Math.hypot(velocity.x, velocity.z);
+            if (isGrounded) {
+                coyoteTimer = 0.14;
+                extraJumpAvailable = true;
+                airDashAvailable = true;
+            } else {
+                coyoteTimer = Math.max(0, coyoteTimer - dt);
+            }
+            airDashCooldown = Math.max(0, airDashCooldown - dt);
+            launchPadCooldown = Math.max(0, launchPadCooldown - dt);
+
+            // Crouch & Slide logic
+            if (keys.crouch) {
+                if (!isCrouching) {
+                    isCrouching = true;
+                    if (horizontalSpeed * 2.23694 > 20 && isGrounded) {
+                        isSliding = true;
+                        slideDirection.set(velocity.x, 0, velocity.z).normalize();
+                        slideSpeed = Math.min(horizontalSpeed * 1.08, maxSlideBoost * 1.35);
+                    }
+                }
+            } else {
+                isCrouching = false;
+                isSliding = false;
+            }
+
+            const targetHeight = isCrouching ? crouchHeight : standHeight;
+            currentHeight += (targetHeight - currentHeight) * (1 - Math.exp(-dt * 10));
+
+            let targetWalkSpeed = 10.5;
+            if (isCrouching) targetWalkSpeed = 3.2;
+            else if (isSprinting) targetWalkSpeed = 20.5;
+
+            const gravitySlopeDir = new THREE.Vector3(0, -1, 0).clone().sub(groundNormal.clone().multiplyScalar(new THREE.Vector3(0, -1, 0).dot(groundNormal))).normalize();
+            const slopeSteepness = 1.0 - groundNormal.y;
+
+            if (isSliding) {
+                const alignment = slideDirection.dot(gravitySlopeDir);
+                if (isGrounded && slopeSteepness > 0.02) {
+                    if (alignment > 0) slideSpeed += slopeSteepness * 22.0 * dt;
+                    else slideSpeed -= slopeSteepness * 35.0 * dt;
+                } else {
+                    slideSpeed -= slideDecayRate * dt;
+                }
+                if (moveInput.lengthSq() > 0) slideDirection.lerp(moveInput, Math.min(1, dt * 0.8)).normalize();
+                if (slideSpeed < 3.8) isSliding = false;
+            }
+
+            if (isSliding) {
+                velocity.x = slideDirection.x * slideSpeed;
+                velocity.z = slideDirection.z * slideSpeed;
+            } else if (moveInput.lengthSq() > 0) {
+                const wishDirection = moveInput.clone();
+                if (isGrounded && slopeSteepness > 0.12) wishDirection.projectOnPlane(groundNormal).normalize();
+                const wishSpeed = isGrounded ? targetWalkSpeed : 10.5;
+                accelerateWishDirection(wishDirection, wishSpeed, isGrounded ? 10 : 3.2, dt);
+            } else {
+                applyHorizontalFriction(isGrounded ? 14.5 : 0.45, dt);
+            }
+
+            if (keys.space && isGrounded && !isSliding) jumpBufferTimer = 0.08;
+            else if (keys.jumpPressed) jumpBufferTimer = 0.14;
+            else jumpBufferTimer = Math.max(0, jumpBufferTimer - dt);
+            if (jumpBufferTimer > 0 && (isGrounded || coyoteTimer > 0) && !isSliding) {
+                velocity.y = 12.5 + Math.min(horizontalSpeed * 0.035, 1.2);
+                jumpBufferTimer = 0;
+                coyoteTimer = 0;
+                isGrounded = false;
+            } else if (jumpBufferTimer > 0 && extraJumpAvailable && !isGrounded && !isSliding) {
+                velocity.y = 11.5;
+                extraJumpAvailable = false;
+                jumpBufferTimer = 0;
+            }
+            keys.jumpPressed = false;
+
+            if (keys.dashPressed && !isGrounded && airDashAvailable && airDashCooldown === 0) {
+                const dashDirection = moveInput.lengthSq() > 0 ? moveInput : forwardVector;
+                const dashSpeed = Math.max(horizontalSpeed, 19);
+                velocity.x = dashDirection.x * dashSpeed;
+                velocity.z = dashDirection.z * dashSpeed;
+                velocity.y = Math.max(velocity.y, 2.5);
+                airDashAvailable = false;
+                airDashCooldown = 0.45;
+            }
+            keys.dashPressed = false;
+
+            if (isGrounded && launchPadCooldown === 0 && currentMap?.launchPads) {
+                for (const pad of currentMap.launchPads) {
+                    const dx = playerPhysicsBody.position.x - pad.position.x;
+                    const dz = playerPhysicsBody.position.z - pad.position.z;
+                    if (dx * dx + dz * dz > 2.4 * 2.4) continue;
+                    velocity.x = pad.direction.x * 21;
+                    velocity.z = pad.direction.z * 21;
+                    velocity.y = 23;
+                    launchPadCooldown = 0.8;
+                    isGrounded = false;
+                    isSliding = false;
+                    break;
+                }
+            }
+
+            const renderPosition = playerPhysicsBody.interpolatedPosition || playerPhysicsBody.position;
+            camera.position.set(
+                renderPosition.x,
+                renderPosition.y + (currentHeight - playerRadius),
+                renderPosition.z
+            );
+
+            // Camera Leaning/Tilting Look angles
+            let intendedRoll = 0;
+            if (keys.a) intendedRoll = 0.038;
+            if (keys.d) intendedRoll = -0.038;
+
+            if (isSliding) {
+                const screenRightDir = new THREE.Vector3(1, 0, 0).applyAxisAngle(upVector, cameraYaw);
+                intendedRoll += slideDirection.dot(screenRightDir) * 0.08;
+            }
+
+            cameraRoll += (intendedRoll - cameraRoll) * (1 - Math.exp(-dt * 18));
+
+            const coreOrientation = new THREE.Quaternion().setFromEuler(new THREE.Euler(cameraPitch, cameraYaw, 0, 'YXZ'));
+            const bankingTiltRotation = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), cameraRoll);
+            coreOrientation.multiply(bankingTiltRotation);
+            camera.quaternion.copy(coreOrientation);
+
+            // Head Bob
+            const moveVelocityMag = new THREE.Vector3(playerPhysicsBody.velocity.x, 0, playerPhysicsBody.velocity.z).length();
+            if (isGrounded && moveVelocityMag > 0.6 && !isSliding) {
+                const rateModifier = isSprinting ? 1.45 : 1.0;
+                headBobCycle += moveVelocityMag * dt * 1.8 * rateModifier;
+                const amplitude = isSprinting ? 0.028 : 0.016;
+                camera.position.y += Math.sin(headBobCycle) * amplitude;
+                camera.position.x += Math.cos(headBobCycle * 0.5) * amplitude * 0.12;
+            }
+
+            // HUD data binding update
+            let stateName = 'AIRBORNE';
+            if (isGrounded) {
+                if (isSliding) stateName = 'SLIDING';
+                else if (isCrouching) stateName = 'CROUCHED';
+                else if (isSprinting && moveVelocityMag > 1) stateName = 'SPRINTING';
+                else if (moveVelocityMag > 1) stateName = 'WALKING';
+                else stateName = 'IDLE';
+            }
+            updateSpatialSpeed(moveVelocityMag * 2.23694, stateName);
+            updateSpatialHudMotion(dt);
+        }
+
+        function loop() {
+            requestAnimationFrame(loop);
+            const dt = clock.getDelta();
+            world.step(1 / 60, dt, 3);
+  
+            updatePlayerMovement(dt); // updates the players movement every frame so the player doesnt just move once and then never again
+            updateWeaponSystems(dt);
+            renderer.clear();
+            renderer.render(scene, camera);
+            renderer.clearDepth();
+            renderer.render(weaponScene, weaponCamera);
+            renderer.clearDepth();
+            renderer.render(hudScene, hudCamera);
+        }
+
+        init();
+        loop();
+    </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+UMD-p15.glb is a basic pistol, is hitscan, 13 mag ammo and 90 reserve ammo, straitforward.
+contains three animations, SHOOT, EQUIP, and RELOAD, once again, straitforward and no way to miss them.
+sits on the lower right hand side of the screen.
+
+story, its just a cheap pistol and the first weapon the player picks up.
+
+the SMG-x19 is a punch packing small package, it fires three shots in just 0.5s but is plauged by small mag sizes just being 30 shots per mag and 120 reserve ammo, player doesnt spawn with it, found on map
+
+weapons picked up on the map are just cannon-es bodyies on the floor, can react to physics
